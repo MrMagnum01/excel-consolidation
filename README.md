@@ -44,8 +44,9 @@ clean spreadsheet plus a record of what was fixed.
    `master.xlsx` with three sheets:
    - **Data** — one row per accepted order: `order_id`, `order_date`
      (normalised to ISO `YYYY-MM-DD`), `customer`, `region`, `product`,
-     `quantity`, `unit_price`, `amount`, `sales_rep`, plus `source_file`
-     and `source_row` for traceability.
+     `quantity`, `unit_price`, `amount`, `currency` (see "Currency
+     handling" below), `sales_rep`, plus `source_file` and `source_row`
+     for traceability.
    - **Validation** — a per-file summary (rows in, rows out, rejected,
      duplicates, status), a reconciliation total, every rejected row with
      its reason, and every duplicate removed with which file/row it first
@@ -95,15 +96,23 @@ export PYTHONPATH=src
 pytest tests -v
 ```
 
-98 tests: header/date/money/quantity normalisation in isolation, the
+108 tests: header/date/money/quantity normalisation in isolation, the
 generator's own ground truth reconciling with itself, the consolidator's
 actual output matching that ground truth *exactly* (file by file and in
-aggregate — not just "close"), every one of the 11 rejection categories
+aggregate — not just "close"), every one of the 13 rejection categories
 present and correctly labelled, the corrupt file and the wrong-structure
 file each surfacing as a categorised exception (never `ok`, never
 skipped), an idempotent re-run producing identical output, region
-inferred correctly from the filename when the column is missing, and a
-subprocess smoke test of the CLI itself.
+inferred correctly from the filename when the column is missing, a
+subprocess smoke test of the CLI itself, and (`tests/test_astra_probes.py`)
+an independent reviewer's adversarial probes for value integrity: non-finite
+(NaN/Infinity), boolean and negative amounts rejected rather than accepted
+as blank; an invalid amount never silently reconstructed from unit price;
+literal customer-supplied text that looks like a formula (`=1+1`) written
+back as literal text, never as a live formula cell; explicit currencies
+preserved and a mismatched amount/unit-price currency rejected; and an
+ambiguous multi-data-sheet workbook excluded rather than narrowed to one
+sheet without saying so.
 
 ## Sample output
 
@@ -117,11 +126,11 @@ Reconciled: True
 
 **Data sheet (first rows):**
 
-| Order Id | Order Date | Customer        | Region    | Product             | Quantity | Unit Price | Amount   | Source File        |
-|----------|------------|------------------|-----------|---------------------|----------|------------|----------|---------------------|
-| ORD-1014 | 2026-06-06 | Morgan Quill     | Northgate | Widget Type B       | 30       | 180.95     | 5428.50  | 01_northgate.xlsx   |
-| ORD-1007 | 2026-02-22 | Dakota Sorensen  | Northgate | Cable Organizer     | 37       | 34.50      | 1276.50  | 01_northgate.xlsx   |
-| ORD-1013 | 2026-06-24 | Avery Kingsley   | Northgate | Conference Table    | 20       | 325.33     | 6506.60  | 01_northgate.xlsx   |
+| Order Id | Order Date | Customer        | Region    | Product             | Quantity | Unit Price | Amount   | Currency | Source File        |
+|----------|------------|------------------|-----------|---------------------|----------|------------|----------|----------|---------------------|
+| ORD-1014 | 2026-06-06 | Morgan Quill     | Northgate | Widget Type B       | 30       | 180.95     | 5428.50  | USD      | 01_northgate.xlsx   |
+| ORD-1007 | 2026-02-22 | Dakota Sorensen  | Northgate | Cable Organizer     | 37       | 34.50      | 1276.50  | USD      | 01_northgate.xlsx   |
+| ORD-1013 | 2026-06-24 | Avery Kingsley   | Northgate | Conference Table    | 20       | 325.33     | 6506.60  | USD      | 01_northgate.xlsx   |
 
 **Validation sheet (excerpt):**
 
@@ -138,13 +147,23 @@ Reconciled: True
 |--------------------------------|-------|
 | banner_rows_skipped            | 8     |
 | blank_rows_removed             | 26    |
-| currency_symbols_stripped      | 262   |
-| dates_normalized               | 343   |
+| currency_assumed_default       | 262   |
+| currency_symbols_stripped      | 168   |
+| dates_normalized               | 339   |
 | duplicate_rows_removed         | 27    |
 | files_region_inferred_from_filename | 5 |
 | files_unmappable_structure     | 1     |
 | files_unreadable                | 1     |
+| thousands_separators_removed   | 167   |
 | totals_rows_removed            | 14    |
+
+`currency_assumed_default` counts every accepted row whose amount and unit
+price carried no explicit currency symbol at all — the pipeline declares
+`USD` as the default (`--currency` is not yet exposed on the CLI; change
+`DEFAULT_CURRENCY` in `schema.py` to consolidate a non-USD batch) rather
+than silently guessing. `currency_symbols_stripped` counts rows where a
+symbol *was* present and was normalised into the `currency` column instead
+of being discarded.
 
 ## How consolidation works
 
@@ -154,14 +173,35 @@ Reconciled: True
   row above the real header, or a differently-named sheet, doesn't matter.
   A file where no sheet reaches at least 6 recognised columns is reported
   as `unmappable_structure` — the whole file, every row, none silently
-  dropped.
+  dropped. If **more than one sheet** in the same workbook independently
+  reaches that threshold, which one is "the" order data can't be inferred,
+  so the whole file is reported as `ambiguous_data_sheets` (every row
+  rejected with that reason, naming the candidate sheets in the detail
+  column) instead of silently picking the best-matching sheet and letting
+  the other one's rows disappear unreported.
 - **Row classification**, in order: an all-blank row is `blank_row`; a row
   carrying a text marker like "Total"/"Grand Total"/"Subtotal" anywhere is
   `totals_row`; a missing required field (`order_id`, `order_date`,
   `product`, `quantity`, `amount`) is `missing_<field>`; an unparsable date
-  is `invalid_date`; an unparsable quantity or amount is `invalid_quantity`
-  / `invalid_amount`. Only after all of that does a row become a candidate
-  for the Data sheet.
+  is `invalid_date`; an unparsable quantity is `invalid_quantity`; an
+  amount that is present but doesn't parse to a finite, non-negative
+  number (including the text `NaN`/`Infinity`, a boolean, or a negative
+  value) is `invalid_amount` and is **never** reconstructed from unit price
+  x quantity — a supplied-but-bad amount is a data problem to report, not a
+  gap to fill in silently; and an amount/unit-price pair that name two
+  different currency symbols is `currency_mismatch`. Only after all of
+  that does a row become a candidate for the Data sheet.
+- **Currency handling**: an explicit currency symbol (`$`/`€`/`£`/`¥`) in
+  the amount or unit-price cell is preserved into the row's `currency`
+  column (`USD`/`EUR`/`GBP`/`JPY`), not discarded — two rows reading
+  `$10.00` and `€10.00` are never collapsed into the same bare `10`. If
+  amount and unit price carry two *different* explicit symbols, the row is
+  rejected (`currency_mismatch`) rather than guessing which one is right.
+  If neither carries a symbol at all, the row is assumed to be in the
+  pipeline's declared default currency (`USD`; see `DEFAULT_CURRENCY` in
+  `schema.py`) and that assumption is counted in the change log
+  (`currency_assumed_default`) every time it's applied, so it's visible,
+  not silent. No currency conversion is ever performed between rows.
 - **Duplicates** are detected by `order_id` across the *whole* run (not
   just within one file): the first file/row to introduce an order id wins
   a place in Data; every later occurrence, in the same file or a different
@@ -171,6 +211,22 @@ Reconciled: True
   row's region cell is blank, the region is inferred from the filename
   (`05_cedar_hollow.xlsx` → `Cedar Hollow`) and the substitution is counted
   in the change log.
+- **Formula safety**: every text-bearing output cell (customer, sales rep,
+  filenames, exception details, etc.) is written with its Excel cell type
+  forced to literal text, never inferred from its content. A source
+  workbook's customer field containing the literal text `=1+1` (typed by a
+  person, not an actual formula) is written back as the text `=1+1`, not
+  as a live formula cell — openpyxl otherwise infers a formula from any
+  string starting with `=`, which would reinterpret untrusted input as
+  executable content in the output workbook.
+- **Formulas already present in an input workbook** are read with
+  `data_only=True`, i.e. the consolidator reads each formula cell's
+  *last-saved cached value*, exactly as Excel wrote it, and never
+  recalculates the formula itself. If a source file was saved by a tool
+  that never computed the formula (no cached value), that cell reads back
+  as blank and is rejected the same way any other missing value is — the
+  pipeline does not claim the cached value is fresh or was ever validated
+  against the formula that produced it.
 
 ## Limits
 
@@ -183,8 +239,14 @@ Reconciled: True
   DATE_FORMATS`); a format outside that list is correctly rejected as
   `invalid_date`, not guessed at.
 - No currency conversion: amounts are normalised (symbols and thousands
-  separators stripped) but not converted between currencies, and this
-  corpus doesn't mix currencies within a column.
+  separators stripped) but never converted between currencies. Each
+  generated file uses one currency symbol consistently throughout (a real
+  regional export is one currency, not mixed row-to-row); the consolidator
+  additionally rejects any row where amount and unit price name two
+  different symbols rather than guessing. A cell with no symbol at all is
+  assumed to be in the pipeline's single declared default currency (`USD`
+  unless `DEFAULT_CURRENCY` is changed) — this is a single-batch,
+  single-currency demo, not a multi-currency reconciliation tool.
 - Duplicate detection keys on `order_id` alone; two genuinely different
   orders that happen to share an id (a real collision, not a re-export)
   would be treated as a duplicate, same trade-off as the PDF-invoice
@@ -212,8 +274,14 @@ LICENSES.md         every open-source library used and its licence
 
 ## Role
 
-Built with AI assistance. Role: automation/data engineer — I directed the
-build (schema, mess taxonomy, reconciliation invariant, test plan) and
-reviewed every file; Claude Sonnet wrote the code and tests under that
-direction. All data is synthetic; no client or employer code, data, or
-spreadsheet layout was used.
+AI-built demo, produced by an automated agent pipeline: an AI coding agent
+(Claude, Anthropic Sonnet) wrote this repository's schema, generator,
+consolidator, tests and README; an independent AI reviewer (a separate
+Codex-based agent) ran adversarial probes against the built code and held
+the repository until the findings were fixed or a claim was narrowed to
+match what the code actually does. The repository owner directed and
+approved the pipeline that produced this code and its fixes, but did not
+personally author or line-by-line review the implementation — that
+distinction is what this section is stating, not a claim of hands-on
+authorship. All data is synthetic; no client or employer code, data, or
+spreadsheet layout was used anywhere in this repository.

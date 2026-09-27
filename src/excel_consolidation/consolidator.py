@@ -13,8 +13,11 @@ from openpyxl import Workbook, load_workbook
 
 from .models import ConsolidationResult, DuplicateRow, FileResult, RejectedRow
 from .schema import (
+    CURRENCY_SYMBOL_TO_CODE,
+    DEFAULT_CURRENCY,
     REQUIRED_FIELDS,
     TOTAL_ROW_MARKERS,
+    detect_currency_symbol,
     detect_field,
     is_blank_value,
     parse_date,
@@ -55,15 +58,29 @@ def _find_header(ws) -> tuple[int | None, dict[int, str]]:
 
 
 def _pick_best_sheet(wb):
+    """Pick the sheet with the most recognised header columns. If more than
+    one sheet in the workbook independently reaches MIN_HEADER_MATCHES, the
+    file is ambiguous -- which sheet is "the" order data can't be inferred
+    silently, so the other viable sheets are returned too rather than
+    picking one and dropping the rest unreported."""
     best_ws, best_row, best_map = None, None, {}
+    other_candidates: list[str] = []
     for ws in wb.worksheets:
         row, mapping = _find_header(ws)
-        if row is not None and len(mapping) > len(best_map):
+        if row is None:
+            continue
+        if len(mapping) > len(best_map):
+            if best_ws is not None:
+                other_candidates.append(best_ws.title)
             best_ws, best_row, best_map = ws, row, mapping
-    return best_ws, best_row, best_map
+        else:
+            other_candidates.append(ws.title)
+    return best_ws, best_row, best_map, other_candidates
 
 
-def process_directory(input_dir: Path, output_dir: Path) -> ConsolidationResult:
+def process_directory(
+    input_dir: Path, output_dir: Path, default_currency: str = DEFAULT_CURRENCY,
+) -> ConsolidationResult:
     input_dir = Path(input_dir)
     output_dir = Path(output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
@@ -96,7 +113,7 @@ def process_directory(input_dir: Path, output_dir: Path) -> ConsolidationResult:
             bump("files_unreadable")
             continue
 
-        ws, header_row, col_map = _pick_best_sheet(wb)
+        ws, header_row, col_map, other_sheets = _pick_best_sheet(wb)
         if ws is None:
             probe_ws = wb.worksheets[0]
             n_rows = max((probe_ws.max_row or 1) - 1, 0)
@@ -112,6 +129,32 @@ def process_directory(input_dir: Path, output_dir: Path) -> ConsolidationResult:
             ))
             bump("files_unmappable_structure")
             bump("rows_rejected_unmappable_structure", n_rows)
+            continue
+
+        if other_sheets:
+            # More than one sheet in this workbook independently looks like
+            # order data. Which one is authoritative can't be inferred, and
+            # silently picking the "best" one means the other sheet's rows
+            # vanish from every report. Reject the whole file instead of
+            # guessing -- nothing here is silently dropped, it's an
+            # explicit, named exception.
+            n_rows = max((ws.max_row or header_row) - header_row, 0)
+            for r in range(header_row + 1, (ws.max_row or header_row) + 1):
+                rejected_rows.append(RejectedRow(
+                    file=filename, row_ref=r, reason="ambiguous_data_sheets",
+                    detail=f"candidate sheets: {ws.title!r}, {', '.join(repr(s) for s in other_sheets)}",
+                ))
+            file_results.append(FileResult(
+                filename=filename, sheet_name=ws.title, status="ambiguous_data_sheets",
+                rows_in=n_rows, rows_out=0, rejected=n_rows, duplicates=0,
+                detail=(
+                    f"{1 + len(other_sheets)} sheets look like order data "
+                    f"(chose {ws.title!r}, also saw {', '.join(repr(s) for s in other_sheets)}); "
+                    "excluded rather than guessed"
+                ),
+            ))
+            bump("files_ambiguous_data_sheets")
+            bump("rows_rejected_ambiguous_data_sheets", n_rows)
             continue
 
         if header_row > 1:
@@ -161,17 +204,43 @@ def process_directory(input_dir: Path, output_dir: Path) -> ConsolidationResult:
                 continue
 
             raw_amount = raw.get("amount")
+            raw_unit_price = raw.get("unit_price")
             amount = parse_money(raw_amount)
-            unit_price = parse_money(raw.get("unit_price"))
-            if amount is None and unit_price is not None:
-                amount = round(unit_price * quantity, 2)
+            unit_price = parse_money(raw_unit_price)
+
+            # `amount` is a REQUIRED_FIELDS entry, so a blank amount was
+            # already rejected above as missing_amount. Reaching here with
+            # amount is None means a value was *supplied* but didn't parse
+            # (non-finite, negative, or not a number) -- that is rejected
+            # outright. It is never silently reconstructed from unit_price:
+            # a present-but-invalid amount is a data problem to report, not
+            # a gap to paper over.
             if amount is None:
                 rejected += 1
                 rejected_rows.append(RejectedRow(file=filename, row_ref=r, reason="invalid_amount", detail=str(raw_amount)))
                 bump("rows_rejected_invalid_amount")
                 continue
+
+            amount_symbol = detect_currency_symbol(raw_amount)
+            price_symbol = detect_currency_symbol(raw_unit_price)
+            if amount_symbol and price_symbol and amount_symbol != price_symbol:
+                rejected += 1
+                rejected_rows.append(RejectedRow(
+                    file=filename, row_ref=r, reason="currency_mismatch",
+                    detail=f"amount={amount_symbol!r} unit_price={price_symbol!r}",
+                ))
+                bump("rows_rejected_currency_mismatch")
+                continue
+            symbol = amount_symbol or price_symbol
+            if symbol:
+                currency = CURRENCY_SYMBOL_TO_CODE[symbol]
+            else:
+                currency = default_currency
+                bump("currency_assumed_default")
+
             if unit_price is None:
                 unit_price = round(amount / quantity, 2) if quantity else 0.0
+                bump("unit_price_derived_from_amount_and_quantity")
             if isinstance(raw_amount, str) and any(sym in raw_amount for sym in "$€£¥"):
                 bump("currency_symbols_stripped")
             if isinstance(raw_amount, str) and "," in raw_amount:
@@ -202,6 +271,7 @@ def process_directory(input_dir: Path, output_dir: Path) -> ConsolidationResult:
                 "quantity": quantity,
                 "unit_price": unit_price,
                 "amount": amount,
+                "currency": currency,
                 "sales_rep": str(raw.get("sales_rep") or "").strip(),
                 "source_file": filename,
                 "source_row": r,
@@ -225,8 +295,25 @@ def process_directory(input_dir: Path, output_dir: Path) -> ConsolidationResult:
 
 _DATA_COLUMNS = [
     "order_id", "order_date", "customer", "region", "product",
-    "quantity", "unit_price", "amount", "sales_rep", "source_file", "source_row",
+    "quantity", "unit_price", "amount", "currency", "sales_rep",
+    "source_file", "source_row",
 ]
+
+
+def _append_as_text(ws, values: list) -> None:
+    """Append a row where every string value is forced to Excel's literal
+    text type, never a formula. openpyxl infers a cell's type from its
+    value when the value is assigned, so a source string like "=1+1"
+    (typed by a customer into an input workbook, not an actual formula) is
+    otherwise written out as an executable formula cell. Forcing
+    `data_type = 's'` after assignment writes it as an inline/shared
+    string instead, so it reloads (and displays in Excel) as the literal
+    text it is."""
+    ws.append(values)
+    row_idx = ws.max_row
+    for col_idx, value in enumerate(values, start=1):
+        if isinstance(value, str):
+            ws.cell(row=row_idx, column=col_idx).data_type = "s"
 
 
 def _write_master_workbook(result: ConsolidationResult, path: Path) -> None:
@@ -234,35 +321,35 @@ def _write_master_workbook(result: ConsolidationResult, path: Path) -> None:
 
     data_ws = wb.active
     data_ws.title = "Data"
-    data_ws.append([c.replace("_", " ").title() for c in _DATA_COLUMNS])
+    _append_as_text(data_ws, [c.replace("_", " ").title() for c in _DATA_COLUMNS])
     for row in result.data_rows:
-        data_ws.append([row[c] for c in _DATA_COLUMNS])
+        _append_as_text(data_ws, [row[c] for c in _DATA_COLUMNS])
 
     val_ws = wb.create_sheet("Validation")
-    val_ws.append(["Per-file summary"])
-    val_ws.append(["File", "Sheet", "Status", "Rows In", "Rows Out", "Rejected", "Duplicates", "Detail"])
+    _append_as_text(val_ws, ["Per-file summary"])
+    _append_as_text(val_ws, ["File", "Sheet", "Status", "Rows In", "Rows Out", "Rejected", "Duplicates", "Detail"])
     totals = result.totals
     for fr in result.file_results:
-        val_ws.append([fr.filename, fr.sheet_name or "", fr.status, fr.rows_in, fr.rows_out, fr.rejected, fr.duplicates, fr.detail])
+        _append_as_text(val_ws, [fr.filename, fr.sheet_name or "", fr.status, fr.rows_in, fr.rows_out, fr.rejected, fr.duplicates, fr.detail])
     val_ws.append([])
-    val_ws.append([
+    _append_as_text(val_ws, [
         "TOTAL", "", "", totals["rows_in"], totals["rows_out"], totals["rejected"], totals["duplicates"],
         "reconciled" if result.reconciles() else "MISMATCH",
     ])
     val_ws.append([])
-    val_ws.append(["Rejected rows"])
-    val_ws.append(["File", "Row", "Reason", "Detail"])
+    _append_as_text(val_ws, ["Rejected rows"])
+    _append_as_text(val_ws, ["File", "Row", "Reason", "Detail"])
     for rr in result.rejected_rows:
-        val_ws.append([rr.file, rr.row_ref, rr.reason, rr.detail])
+        _append_as_text(val_ws, [rr.file, rr.row_ref, rr.reason, rr.detail])
     val_ws.append([])
-    val_ws.append(["Duplicates removed"])
-    val_ws.append(["File", "Row", "Order ID", "First seen file", "First seen row"])
+    _append_as_text(val_ws, ["Duplicates removed"])
+    _append_as_text(val_ws, ["File", "Row", "Order ID", "First seen file", "First seen row"])
     for dr in result.duplicate_rows:
-        val_ws.append([dr.file, dr.row_ref, dr.order_id, dr.first_seen_file, dr.first_seen_row])
+        _append_as_text(val_ws, [dr.file, dr.row_ref, dr.order_id, dr.first_seen_file, dr.first_seen_row])
 
     log_ws = wb.create_sheet("Change log")
-    log_ws.append(["Transformation", "Count"])
+    _append_as_text(log_ws, ["Transformation", "Count"])
     for key in sorted(result.change_log):
-        log_ws.append([key, result.change_log[key]])
+        _append_as_text(log_ws, [key, result.change_log[key]])
 
     wb.save(path)

@@ -6,6 +6,7 @@ Shared by both sides so the two can be tested against each other exactly.
 from __future__ import annotations
 
 import datetime as _dt
+import math
 import re
 
 # The canonical, normalised column names the master Data sheet uses.
@@ -114,6 +115,15 @@ DATE_FORMATS = [
 
 CURRENCY_SYMBOLS = "$€£¥"
 
+# Maps an explicit currency symbol found in a money cell to its ISO code.
+# Order matters only for iteration determinism; each symbol is distinct.
+CURRENCY_SYMBOL_TO_CODE = {"$": "USD", "€": "EUR", "£": "GBP", "¥": "JPY"}
+
+# Used when a money cell carries no explicit currency symbol at all. This
+# is a declared, documented assumption (see README), not a silent guess:
+# the consolidator records it in the change log every time it applies.
+DEFAULT_CURRENCY = "USD"
+
 _NORMALIZE_RE = re.compile(r"[^a-z0-9]+")
 
 
@@ -173,11 +183,21 @@ def parse_date(raw: object) -> _dt.date | None:
 
 def parse_money(raw: object) -> float | None:
     """Parse a currency-symbol-and-thousands-separator number. Returns None
-    if the cleaned text isn't a valid number."""
+    if the cleaned text isn't a valid, finite, non-negative number. Rejects
+    NaN/Infinity (Python's float() happily parses the literal text "nan" /
+    "infinity", which is not a usable money value), booleans (a bool is a
+    subclass of int in Python but is never a legitimate amount), and
+    negative values (out of domain for an order amount/unit price in this
+    schema)."""
     if raw is None:
         return None
+    if isinstance(raw, bool):
+        return None
     if isinstance(raw, (int, float)):
-        return round(float(raw), 2)
+        value = float(raw)
+        if not math.isfinite(value) or value < 0:
+            return None
+        return round(value, 2)
     text = str(raw).strip()
     if not text:
         return None
@@ -187,9 +207,24 @@ def parse_money(raw: object) -> float | None:
     if not text:
         return None
     try:
-        return round(float(text), 2)
+        value = float(text)
     except ValueError:
         return None
+    if not math.isfinite(value) or value < 0:
+        return None
+    return round(value, 2)
+
+
+def detect_currency_symbol(raw: object) -> str | None:
+    """Return the explicit currency symbol present in a raw money cell's
+    text (e.g. "$1,234.56" -> "$"), or None if the cell carries no symbol
+    at all (a bare number). Does not attempt to parse the number."""
+    if not isinstance(raw, str):
+        return None
+    for sym in CURRENCY_SYMBOLS:
+        if sym in raw:
+            return sym
+    return None
 
 
 def parse_quantity(raw: object) -> int | None:

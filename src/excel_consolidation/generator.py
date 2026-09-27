@@ -54,8 +54,7 @@ FORCED_DEFECTS = {
 }
 
 
-def _fmt_money(value: float, rng: random.Random) -> str:
-    symbol = rng.choice(["", "", "$", "€", "£"])
+def _fmt_money(value: float, symbol: str, rng: random.Random) -> str:
     if rng.random() < 0.4:
         text = f"{value:,.2f}"
     else:
@@ -124,13 +123,13 @@ def _make_invalid_row(defect: str, region: str, rng: random.Random, id_counter: 
     return row
 
 
-def _cell_value(field: str, value: object, rng: random.Random):
+def _cell_value(field: str, value: object, currency_symbol: str, rng: random.Random):
     if value is None:
         return None
     if field == "order_date":
         return _fmt_date(value, rng) if isinstance(value, _dt.date) else value
     if field in ("unit_price", "amount"):
-        return _fmt_money(value, rng) if isinstance(value, (int, float)) else value
+        return _fmt_money(value, currency_symbol, rng) if isinstance(value, (int, float)) else value
     if field == "quantity" and isinstance(value, int):
         return str(value) if rng.random() < 0.3 else value
     return value
@@ -199,13 +198,21 @@ def _build_normal_file_rows(
 def _write_normal_workbook(
     path: Path, sheet_name: str, header_style: dict, field_order: list[str],
     add_banner: bool, events: list[dict], render_rng: random.Random,
+    currency_symbol: str,
 ) -> None:
     """`render_rng` is a stream isolated from the content-decision `rng`
     used by _build_normal_file_rows(): it only chooses *cosmetic* things
-    (which date format to render, which currency symbol/thousands style)
-    and must never be the same object as the content rng, or build_manifests()
+    (which date format to render, which thousands-separator style) and
+    must never be the same object as the content rng, or build_manifests()
     (which never renders a cell) would silently drift out of sync with
-    generate_all() (which does)."""
+    generate_all() (which does).
+
+    `currency_symbol` is fixed for the whole file (chosen once by the
+    caller), not per cell: a real regional export uses one currency
+    throughout, and this workbook's `amount`/`unit_price` columns must not
+    mix symbols within themselves, or the file no longer represents a
+    single-currency source and the consolidator has no sound basis for
+    picking one."""
     wb = Workbook()
     ws = wb.active
     ws.title = sheet_name
@@ -225,7 +232,7 @@ def _write_normal_workbook(
     for event in events:
         data = event["data"]
         for col, fld in enumerate(field_order, start=1):
-            value = None if data is None else _cell_value(fld, data.get(fld), render_rng)
+            value = None if data is None else _cell_value(fld, data.get(fld), currency_symbol, render_rng)
             ws.cell(row=row_idx, column=col, value=value)
         row_idx += 1
 
@@ -307,9 +314,11 @@ def generate_all(out_dir: Path, seed: int = 7) -> list[FileManifest]:
         header_style = HEADER_STYLES[style_idx]
         add_banner = slot % 3 == 0
         sheet_name = render_rng.choice(["Data", "Sales", "Sheet1", "Export", region[:20]])
+        # One currency symbol for the whole file -- see _write_normal_workbook.
+        currency_symbol = render_rng.choice(["", "", "$", "€", "£"])
         _write_normal_workbook(
             out_dir / filename, sheet_name, header_style, field_order,
-            add_banner, events, render_rng,
+            add_banner, events, render_rng, currency_symbol,
         )
         manifests.append(manifest)
 
