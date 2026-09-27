@@ -96,7 +96,7 @@ export PYTHONPATH=src
 pytest tests -v
 ```
 
-108 tests: header/date/money/quantity normalisation in isolation, the
+118 tests: header/date/money/quantity normalisation in isolation, the
 generator's own ground truth reconciling with itself, the consolidator's
 actual output matching that ground truth *exactly* (file by file and in
 aggregate — not just "close"), every one of the 13 rejection categories
@@ -110,9 +110,12 @@ an independent reviewer's adversarial probes for value integrity: non-finite
 as blank; an invalid amount never silently reconstructed from unit price;
 literal customer-supplied text that looks like a formula (`=1+1`) written
 back as literal text, never as a live formula cell; explicit currencies
-preserved and a mismatched amount/unit-price currency rejected; and an
-ambiguous multi-data-sheet workbook excluded rather than narrowed to one
-sheet without saying so.
+preserved and a mismatched amount/unit-price currency rejected; a cell
+naming more than one currency symbol, or with malformed thousands
+grouping, rejected rather than reinterpreted; an ambiguous multi-data-sheet
+workbook excluded rather than narrowed to one sheet without saying so, with
+row coverage counted across every candidate sheet, not just the one that
+would have been chosen.
 
 ## Sample output
 
@@ -178,7 +181,10 @@ of being discarded.
   so the whole file is reported as `ambiguous_data_sheets` (every row
   rejected with that reason, naming the candidate sheets in the detail
   column) instead of silently picking the best-matching sheet and letting
-  the other one's rows disappear unreported.
+  the other one's rows disappear unreported. The file's `rows_in`/`rejected`
+  counts add up every candidate sheet's own rows, not just the sheet that
+  would have been chosen, so the reported row coverage for an ambiguous
+  file is the true total across every candidate sheet.
 - **Row classification**, in order: an all-blank row is `blank_row`; a row
   carrying a text marker like "Total"/"Grand Total"/"Subtotal" anywhere is
   `totals_row`; a missing required field (`order_id`, `order_date`,
@@ -201,7 +207,11 @@ of being discarded.
   pipeline's declared default currency (`USD`; see `DEFAULT_CURRENCY` in
   `schema.py`) and that assumption is counted in the change log
   (`currency_assumed_default`) every time it's applied, so it's visible,
-  not silent. No currency conversion is ever performed between rows.
+  not silent. No currency conversion is ever performed between rows, and
+  the pipeline never sums an amount across rows of different currencies.
+  A money cell naming more than one distinct currency symbol at once
+  (`$€10.00`) is rejected as `invalid_amount` — which currency is correct
+  is not decidable, so it is an error, not a guess.
 - **Duplicates** are detected by `order_id` across the *whole* run (not
   just within one file): the first file/row to introduce an order id wins
   a place in Data; every later occurrence, in the same file or a different
@@ -238,15 +248,26 @@ of being discarded.
 - Date parsing covers 5 unambiguous text formats (`schema.py:
   DATE_FORMATS`); a format outside that list is correctly rejected as
   `invalid_date`, not guessed at.
-- No currency conversion: amounts are normalised (symbols and thousands
-  separators stripped) but never converted between currencies. Each
-  generated file uses one currency symbol consistently throughout (a real
-  regional export is one currency, not mixed row-to-row); the consolidator
-  additionally rejects any row where amount and unit price name two
-  different symbols rather than guessing. A cell with no symbol at all is
-  assumed to be in the pipeline's single declared default currency (`USD`
-  unless `DEFAULT_CURRENCY` is changed) — this is a single-batch,
-  single-currency demo, not a multi-currency reconciliation tool.
+- No currency conversion and no cross-currency monetary total: each row
+  keeps whatever currency it explicitly named (a `currency` column per
+  row), amounts are normalised (symbols and thousands separators stripped
+  down to a number) but never converted between currencies, and nothing
+  sums an "amount" across rows of different currencies. Each generated
+  file uses one currency symbol consistently throughout (a real regional
+  export is one currency, not mixed row-to-row), but the consolidated
+  *batch* is not single-currency — different files can and do use
+  different symbols, and the Data sheet retains that per row. A row whose
+  amount and unit price name two different symbols is rejected
+  (`currency_mismatch`) rather than guessing which is right; a cell with
+  no symbol at all is assumed to be in the pipeline's single declared
+  default currency (`USD` unless `DEFAULT_CURRENCY` is changed). This is a
+  currency-preserving consolidation, not a multi-currency reconciliation
+  or FX tool.
+- A money cell naming more than one distinct currency symbol (`$€10.00`)
+  or using a malformed thousands grouping (`1,25` — a group must be
+  exactly 3 digits) is rejected as `invalid_amount`, not reinterpreted by
+  blindly stripping symbols/commas (`schema.py: parse_money`,
+  `_GROUPED_NUMBER_RE`). The same grouping rule applies to quantities.
 - Duplicate detection keys on `order_id` alone; two genuinely different
   orders that happen to share an id (a real collision, not a re-export)
   would be treated as a duplicate, same trade-off as the PDF-invoice

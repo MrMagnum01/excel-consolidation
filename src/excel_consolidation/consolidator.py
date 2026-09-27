@@ -61,20 +61,20 @@ def _pick_best_sheet(wb):
     """Pick the sheet with the most recognised header columns. If more than
     one sheet in the workbook independently reaches MIN_HEADER_MATCHES, the
     file is ambiguous -- which sheet is "the" order data can't be inferred
-    silently, so the other viable sheets are returned too rather than
-    picking one and dropping the rest unreported."""
-    best_ws, best_row, best_map = None, None, {}
-    other_candidates: list[str] = []
+    silently, so the other viable sheets are returned too (each as its own
+    (worksheet, header_row, col_map) candidate, not just a name) rather
+    than picking one and dropping the rest unreported -- callers need the
+    full candidate to count and reject that sheet's own rows too."""
+    candidates: list[tuple] = []
     for ws in wb.worksheets:
         row, mapping = _find_header(ws)
-        if row is None:
-            continue
-        if len(mapping) > len(best_map):
-            if best_ws is not None:
-                other_candidates.append(best_ws.title)
-            best_ws, best_row, best_map = ws, row, mapping
-        else:
-            other_candidates.append(ws.title)
+        if row is not None:
+            candidates.append((ws, row, mapping))
+    if not candidates:
+        return None, None, {}, []
+    best_idx = max(range(len(candidates)), key=lambda i: len(candidates[i][2]))
+    best_ws, best_row, best_map = candidates[best_idx]
+    other_candidates = [c for i, c in enumerate(candidates) if i != best_idx]
     return best_ws, best_row, best_map, other_candidates
 
 
@@ -137,20 +137,33 @@ def process_directory(
             # silently picking the "best" one means the other sheet's rows
             # vanish from every report. Reject the whole file instead of
             # guessing -- nothing here is silently dropped, it's an
-            # explicit, named exception.
-            n_rows = max((ws.max_row or header_row) - header_row, 0)
-            for r in range(header_row + 1, (ws.max_row or header_row) + 1):
-                rejected_rows.append(RejectedRow(
-                    file=filename, row_ref=r, reason="ambiguous_data_sheets",
-                    detail=f"candidate sheets: {ws.title!r}, {', '.join(repr(s) for s in other_sheets)}",
-                ))
+            # explicit, named exception. Row coverage is counted across
+            # *every* candidate sheet (not just the one that would have
+            # been chosen): the file's total row count is the sum of each
+            # candidate's own rows, and each rejected row records which
+            # sheet it came from, since two candidates can each have a
+            # "row 2" that are not the same row.
+            other_titles = [c_ws.title for c_ws, _, _ in other_sheets]
+            all_candidates = [(ws, header_row)] + [(c_ws, c_row) for c_ws, c_row, _ in other_sheets]
+            n_rows = 0
+            for c_ws, c_row in all_candidates:
+                sheet_rows = max((c_ws.max_row or c_row) - c_row, 0)
+                n_rows += sheet_rows
+                for r in range(c_row + 1, (c_ws.max_row or c_row) + 1):
+                    rejected_rows.append(RejectedRow(
+                        file=filename, row_ref=r, reason="ambiguous_data_sheets",
+                        detail=(
+                            f"sheet {c_ws.title!r} (candidate sheets: "
+                            f"{ws.title!r}, {', '.join(repr(s) for s in other_titles)})"
+                        ),
+                    ))
             file_results.append(FileResult(
                 filename=filename, sheet_name=ws.title, status="ambiguous_data_sheets",
                 rows_in=n_rows, rows_out=0, rejected=n_rows, duplicates=0,
                 detail=(
                     f"{1 + len(other_sheets)} sheets look like order data "
-                    f"(chose {ws.title!r}, also saw {', '.join(repr(s) for s in other_sheets)}); "
-                    "excluded rather than guessed"
+                    f"(chose {ws.title!r}, also saw {', '.join(repr(s) for s in other_titles)}); "
+                    "excluded rather than guessed; rows_in counts every candidate sheet"
                 ),
             ))
             bump("files_ambiguous_data_sheets")

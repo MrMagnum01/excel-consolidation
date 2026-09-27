@@ -62,6 +62,15 @@ def test_parse_money_rejects_non_numeric_text(text):
     assert parse_money(text) is None
 
 
+@pytest.mark.parametrize("text", ["$€10.00", "€£5.00", "1,25", "1,2345", "12,3.45"])
+def test_parse_money_rejects_ambiguous_currency_or_malformed_grouping(text):
+    """More than one distinct currency symbol in a cell, or digit grouping
+    that doesn't match the declared thousands-grouping grammar (a group
+    must be exactly 3 digits), is rejected -- never reinterpreted by
+    blindly stripping symbols/commas."""
+    assert parse_money(text) is None
+
+
 @pytest.mark.parametrize("text,expected", [
     ("12", 12),
     ("12.0", 12),
@@ -75,4 +84,12 @@ def test_parse_quantity_accepts_valid_forms(text, expected):
 
 @pytest.mark.parametrize("text", ["many", "n/a", "-", "0", "-5", "", None, "12.5"])
 def test_parse_quantity_rejects_invalid_or_non_positive(text):
+    assert parse_quantity(text) is None
+
+
+@pytest.mark.parametrize("text", ["1,20", "1,2345"])
+def test_parse_quantity_rejects_malformed_grouping(text):
+    """Same declared grouped-comma grammar as parse_money: a malformed
+    group like '1,20' must be rejected, not silently read as 120 by
+    stripping the comma."""
     assert parse_quantity(text) is None

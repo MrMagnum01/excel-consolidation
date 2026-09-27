@@ -124,6 +124,13 @@ CURRENCY_SYMBOL_TO_CODE = {"$": "USD", "€": "EUR", "£": "GBP", "¥": "JPY"}
 # the consolidator records it in the change log every time it applies.
 DEFAULT_CURRENCY = "USD"
 
+# The declared money/quantity grammar: either an ungrouped run of digits,
+# or digits grouped into a leading 1-3 digit group followed by comma-groups
+# of exactly 3 digits (1,234 / 12,345,678 but never 1,25 or 1,2345), with an
+# optional dot-decimal tail. No locale guessing beyond this one grammar --
+# a cell that doesn't match it is rejected, not reinterpreted.
+_GROUPED_NUMBER_RE = re.compile(r"^(?:\d{1,3}(?:,\d{3})+|\d+)(?:\.\d+)?$")
+
 _NORMALIZE_RE = re.compile(r"[^a-z0-9]+")
 
 
@@ -188,7 +195,14 @@ def parse_money(raw: object) -> float | None:
     "infinity", which is not a usable money value), booleans (a bool is a
     subclass of int in Python but is never a legitimate amount), and
     negative values (out of domain for an order amount/unit price in this
-    schema)."""
+    schema).
+
+    Also rejects a cell naming more than one distinct currency symbol
+    (e.g. "$€10.00" -- which currency is not decidable, so it's an error,
+    not a pick) and a cell whose digit grouping doesn't match the declared
+    dot-decimal/grouped-comma grammar (e.g. "1,25" -- a 2-digit group is
+    not a thousands separator, so this is malformed, not "125"). No locale
+    guessing: only that one declared grammar is accepted."""
     if raw is None:
         return None
     if isinstance(raw, bool):
@@ -201,13 +215,16 @@ def parse_money(raw: object) -> float | None:
     text = str(raw).strip()
     if not text:
         return None
-    for sym in CURRENCY_SYMBOLS:
+    symbols_present = {sym for sym in CURRENCY_SYMBOLS if sym in text}
+    if len(symbols_present) > 1:
+        return None
+    for sym in symbols_present:
         text = text.replace(sym, "")
-    text = text.replace(",", "").strip()
-    if not text:
+    text = text.strip()
+    if not text or not _GROUPED_NUMBER_RE.match(text):
         return None
     try:
-        value = float(text)
+        value = float(text.replace(",", ""))
     except ValueError:
         return None
     if not math.isfinite(value) or value < 0:
@@ -230,7 +247,9 @@ def detect_currency_symbol(raw: object) -> str | None:
 def parse_quantity(raw: object) -> int | None:
     """Parse an integer quantity, tolerating '12', '12.0', ' 12 ', '1,200'.
     Returns None (and rejects <= 0) for anything not a positive integer
-    quantity."""
+    quantity. Uses the same declared grouped-comma grammar as parse_money,
+    so a malformed grouping like '1,20' is rejected rather than silently
+    read as 120."""
     if raw is None:
         return None
     if isinstance(raw, bool):
@@ -241,9 +260,10 @@ def parse_quantity(raw: object) -> int | None:
         if raw.is_integer() and raw > 0:
             return int(raw)
         return None
-    text = str(raw).strip().replace(",", "")
-    if not text:
+    text = str(raw).strip()
+    if not text or not _GROUPED_NUMBER_RE.match(text):
         return None
+    text = text.replace(",", "")
     try:
         value = float(text)
     except ValueError:

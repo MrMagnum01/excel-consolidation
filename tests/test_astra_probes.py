@@ -180,3 +180,51 @@ def test_ambiguous_multi_sheet_workbook_is_excluded_not_silently_narrowed(tmp_pa
     assert {rr.reason for rr in result.rejected_rows} == {"ambiguous_data_sheets"}
     assert "files_ambiguous_data_sheets" in result.change_log
     assert data_ws.max_row == 1
+
+
+# --- Re-review finding: ambiguous-file row reconciliation must count every
+# candidate sheet, not just the one that would have been chosen ------------
+
+def test_ambiguous_workbook_row_coverage_counts_every_candidate_sheet(tmp_path):
+    """Two candidate sheets, one data row each. The old behaviour only
+    counted the chosen sheet's row (rows_in=1), even though the whole
+    workbook -- both sheets -- is excluded; the README promises every row
+    is accounted for. rows_in/rejected must cover both sheets' rows, and
+    each rejected row's provenance must say which sheet it came from."""
+    result, data_ws, _ = _run_one(tmp_path, "extra_sheet_coverage", [{}], extra=True)
+    fr = result.file_results[0]
+    assert fr.status == "ambiguous_data_sheets"
+    assert fr.rows_in == 2, "row coverage must include both candidate sheets, not just the chosen one"
+    assert fr.rejected == 2
+    assert fr.rows_out == 0
+    assert len(result.rejected_rows) == 2
+    details = " | ".join(rr.detail for rr in result.rejected_rows)
+    assert "'Orders'" in details and "'More Orders'" in details, result.rejected_rows
+    assert result.reconciles()
+    assert data_ws.max_row == 1
+
+
+# --- Re-review finding: money grammar must not silently merge currencies
+# or reinterpret malformed thousands grouping -------------------------------
+
+def test_conflicting_currency_symbols_in_one_cell_are_rejected(tmp_path):
+    """`$€10.00` names two different currencies in the same cell -- which
+    one is correct is not decidable, so the row must be rejected, not
+    accepted as USD 10.00 (stripping every symbol in turn used to do
+    exactly that)."""
+    result, data_ws, _ = _run_one(tmp_path, "conflicting_symbols", [{"amount": "$€10.00"}])
+    fr = result.file_results[0]
+    assert fr.rows_out == 0
+    assert {rr.reason for rr in result.rejected_rows} == {"invalid_amount"}
+    assert data_ws.max_row == 1
+
+
+def test_malformed_thousands_grouping_is_rejected_not_reinterpreted(tmp_path):
+    """`€1,25` is not a valid grouped-comma number (a thousands group is
+    exactly 3 digits) -- it must be rejected, not read as EUR 125.00 by
+    blindly stripping the comma."""
+    result, data_ws, _ = _run_one(tmp_path, "comma_decimal", [{"amount": "€1,25"}])
+    fr = result.file_results[0]
+    assert fr.rows_out == 0
+    assert {rr.reason for rr in result.rejected_rows} == {"invalid_amount"}
+    assert data_ws.max_row == 1
